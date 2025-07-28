@@ -2,8 +2,7 @@
 let db, currentRideId = null;
 let currentRideDataPoints = [], accelerometerBuffer = [];
 let latestGpsPosition = null, watchId = null, motionListenerActive = false;
-let dataCollectionInterval = null;
-let lastLowPassZ = 0;
+let dataCollectionInterval = null, lastLowPassZ = 0;
 
 // Live map
 let map, currentLocationMarker, currentRidePath, historicalRoughnessLayer;
@@ -107,7 +106,7 @@ function initChart() {
   });
 }
 
-// --- Recap Map & Chart ---
+// --- Recap Map & Chart Initialization ---
 function initRecapMap() {
   if (recapMap) recapMap.remove();
   recapMap = L.map('recapMap').setView([51.0447, -114.0719], 13);
@@ -151,7 +150,7 @@ function initRecapChart() {
   });
 }
 
-// --- Utilities ---
+// --- Utility Functions ---
 function calculateVariance(arr) {
   if (!arr.length) return 0;
   const mean = arr.reduce((s, v) => s + v, 0) / arr.length;
@@ -176,10 +175,10 @@ function roughnessToColor(r) {
   return ROUGH_COLORS[ROUGH_COLORS.length - 1];
 }
 
-// --- Sensor Callbacks ---
+// --- Sensor Handlers ---
 function gpsSuccess(pos) { latestGpsPosition = pos; }
 function gpsError(err) {
-  const msgs = {1: 'Permission denied', 2: 'Unavailable', 3: 'Timed out'};
+  const msgs = {1:'Permission denied',2:'Unavailable',3:'Timed out'};
   statusDiv.textContent = msgs[err.code] || 'GPS error';
   if (err.code === 1) stopRide();
 }
@@ -191,7 +190,7 @@ function handleMotion(evt) {
   }
 }
 
-// --- Core Loop ---
+// --- Core Data Loop ---
 async function processCombinedDataPoint() {
   if (!currentRideId || !latestGpsPosition) {
     statusDiv.textContent = 'Waiting for GPS…';
@@ -473,7 +472,7 @@ async function showRideDetails(rideId) {
   }
 
   // Recap chart
-  const data = dps.map(dp => ({ x:new Date(dp.timestamp), y:dp.roughnessValue, meta:dp }));
+  const data = dps.map(dp => ({ x: new Date(dp.timestamp), y: dp.roughnessValue, meta: dp }));
   if (recapChart) {
     recapChart.data.datasets[0].data = data;
     recapChart.update();
@@ -496,7 +495,8 @@ async function showRideDetails(rideId) {
   updateHistoricalDisplay(last.latitude, last.longitude, recapHistoricalLayer, recapMap);
 
   // Text details
-  let txt = `Ride ID: ${rideRec.rideId}\nStart: ${new Date(rideRec.startTime).toLocaleString()}\n` +
+  let txt = `Ride ID: ${rideRec.rideId}\n` +
+            `Start: ${new Date(rideRec.startTime).toLocaleString()}\n` +
             `End: ${new Date(rideRec.endTime).toLocaleString()}\n` +
             `Duration: ${Math.floor(rideRec.duration/60)}m ${rideRec.duration%60}s\n` +
             `Points: ${rideRec.totalDataPoints}\n\n— Data Points —\n`;
@@ -513,7 +513,7 @@ function hideRideDetails() {
   detailContent.textContent = '';
 }
 
-// --- Bootstrap ---
+// --- Bootstrap on load ---
 document.addEventListener('DOMContentLoaded', () => {
   statusDiv         = document.getElementById('status');
   startButton       = document.getElementById('startButton');
@@ -529,5 +529,6 @@ document.addEventListener('DOMContentLoaded', () => {
   closeDetailButton.addEventListener('click', hideRideDetails);
 
   initializeMap();
-  openDb().then(initChart);
+  openDb();
+  initChart();
 });
