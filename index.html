@@ -6,7 +6,8 @@
   <title>Bike Roughness Mapper MVP</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap" rel="stylesheet"/>
   <link rel="stylesheet" href="style.css"/>
-  <!-- Leaflet (no integrity attributes) -->
+
+  <!-- Leaflet (no integrity attrs) -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 </head>
 <body>
@@ -19,7 +20,11 @@
     </div>
     <div id="dataPointsCounter">Data Points: 0</div>
 
+    <!-- Main map -->
     <div id="map"></div>
+
+    <!-- Live vibration chart -->
+    <canvas id="vibrationChart" height="200" style="width:100%; margin-bottom:20px;"></canvas>
 
     <h2>Past Rides</h2>
     <ul id="pastRidesList"></ul>
@@ -32,17 +37,16 @@
       <button id="closeDetailButton">Close</button>
     </div>
 
-    <!-- Recap Map -->
+    <!-- Recap map -->
     <div id="recapMap" style="height:300px; width:100%; margin-bottom:20px;"></div>
 
-    <!-- Recap Chart -->
+    <!-- Recap chart -->
     <canvas id="recapChart" height="200" style="width:100%; margin-bottom:20px;"></canvas>
 
-    <!-- Raw detail text -->
     <pre id="detailContent"></pre>
   </div>
 
-  <!-- Leaflet & Chart.js scripts -->
+  <!-- Scripts: Leaflet, Chart.js, then our code -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="script.js"></script>
