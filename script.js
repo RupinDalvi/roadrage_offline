@@ -175,7 +175,7 @@ function roughnessToColor(r) {
   return ROUGH_COLORS[ROUGH_COLORS.length - 1];
 }
 
-// --- Sensor Handlers ---
+// --- Sensor Callbacks ---
 function gpsSuccess(pos) { latestGpsPosition = pos; }
 function gpsError(err) {
   const msgs = {1:'Permission denied',2:'Unavailable',3:'Timed out'};
@@ -294,6 +294,7 @@ async function updateHistoricalDisplay(lat, lon, layerGroup, targetMap) {
 }
 
 // --- Highlight on Hover ---
+// live
 function highlightPointOnMap(idx) {
   if (!chartDataset[idx]) return;
   const dp = chartDataset[idx].meta;
@@ -303,6 +304,7 @@ function highlightPointOnMap(idx) {
   }).addTo(map);
   setTimeout(() => map.removeLayer(recapHighlight), 3000);
 }
+// recap
 function highlightRecapPointOnMap(idx) {
   const data = recapChart?.data?.datasets[0]?.data;
   if (!data || !data[idx]) return;
@@ -461,40 +463,27 @@ async function showRideDetails(rideId) {
 
   const tx = db.transaction(['rides','rideDataPoints'],'readonly');
   const rideRec = await promisifiedDbRequest(tx.objectStore('rides').get(rideId));
-  const dps     = await promisifiedDbRequest(
+  let dps     = await promisifiedDbRequest(
     tx.objectStore('rideDataPoints').index('by_rideId').getAll(rideId)
   );
   await tx.complete;
 
-  if (!rideRec || !dps.length) {
+  if (!rideRec || !Array.isArray(dps) || dps.length === 0) {
     detailContent.textContent = 'No data for this ride.';
     return;
   }
-  
-  // 1) Sort by time
-  dps.sort((a, b) => a.timestamp - b.timestamp);
-  
-  // 2) Build the chart data
-  const chartData = dps.map(dp => ({
-    x: new Date(dp.timestamp),
-    y: dp.roughnessValue,
-    meta: dp
-  }));
-  
-  // 3) Update recap chart
-  if (recapChart) {
-    recapChart.data.datasets[0].data = chartData;
-    recapChart.update();
-  }
 
-  // Recap chart
+  // **Sort chronologically by timestamp** before charting
+  dps.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Populate recap chart
   const data = dps.map(dp => ({ x: new Date(dp.timestamp), y: dp.roughnessValue, meta: dp }));
   if (recapChart) {
     recapChart.data.datasets[0].data = data;
     recapChart.update();
   }
 
-  // Recap map
+  // Populate recap map
   recapRidePath.setLatLngs([]);
   recapHistoricalLayer.clearLayers();
   dps.forEach(dp => {
@@ -510,7 +499,7 @@ async function showRideDetails(rideId) {
   const last = dps[dps.length - 1];
   updateHistoricalDisplay(last.latitude, last.longitude, recapHistoricalLayer, recapMap);
 
-  // Text details
+  // Fill textual details
   let txt = `Ride ID: ${rideRec.rideId}\n` +
             `Start: ${new Date(rideRec.startTime).toLocaleString()}\n` +
             `End: ${new Date(rideRec.endTime).toLocaleString()}\n` +
@@ -529,7 +518,7 @@ function hideRideDetails() {
   detailContent.textContent = '';
 }
 
-// --- Bootstrap on load ---
+// --- Bootstrap ---
 document.addEventListener('DOMContentLoaded', () => {
   statusDiv         = document.getElementById('status');
   startButton       = document.getElementById('startButton');
