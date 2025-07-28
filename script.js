@@ -1,50 +1,44 @@
-// Global variables for IndexedDB and ride state
-let db;
-let currentRideId = null;
-let currentRideDataPoints = [];
-let accelerometerBuffer = [];
-let latestGpsPosition = null;
-let watchId = null;
-let motionListenerActive = false;
+// --- Globals & State ---
+let db, currentRideId = null;
+let currentRideDataPoints = [], accelerometerBuffer = [];
+let latestGpsPosition = null, watchId = null, motionListenerActive = false;
 let dataCollectionInterval = null;
+let lastLowPassZ = 0; // for HPF
 
-// Low‑pass state for HPF
-const HPF_ALPHA = 0.8;
-let lastLowPassZ = 0;
-
-// Map variables
+// Leaflet live map
 let map, currentLocationMarker, currentRidePath, historicalRoughnessLayer;
 let mapInitialized = false;
 
-// Chart.js variables
+// Chart.js live chart
 let vibrationChart, chartDataset = [];
 
-// DOM Elements
+// Recap map & chart
+let recapMap, recapRidePath, recapHistoricalLayer, recapChart, recapHighlight;
+
+// DOM refs
 let statusDiv, startButton, stopButton, dataPointsCounter;
 let pastRidesList, rideDetailView, detailContent, closeDetailButton;
 
 // Constants
-const DB_NAME = 'BikeRoughnessDB';
-const DB_VERSION = 2;
-const DATA_COLLECTION_INTERVAL_MS = 3000;
-const HISTORICAL_DISPLAY_RADIUS_M = 150;
-const PROXIMITY_MATCH_RADIUS_M = 10;
-
-// Color scale
+const DB_NAME = 'BikeRoughnessDB', DB_VERSION = 2;
+const DATA_INTERVAL_MS = 3000, HIST_RADIUS = 150, PROXIMITY_RADIUS = 10;
+const HPF_ALPHA = 0.8;
 const ROUGH_THRESHOLDS = [0,3,6,9,15,21,30];
 const ROUGH_COLORS     = ['#ffffff','#dddddd','#bbbbbb','#999999','#777777','#555555','#333333','#000000'];
 
-function promisifiedDbRequest(request) {
+// --- IndexedDB Helper ---
+function promisifiedDbRequest(req) {
   return new Promise((res, rej) => {
-    request.onsuccess = e => res(e.target.result);
-    request.onerror   = e => rej(e.target.error);
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
   });
 }
 
+// --- DB Initialization ---
 function openDb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = e => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = e => {
       db = e.target.result;
       if (!db.objectStoreNames.contains('rides'))
         db.createObjectStore('rides', { keyPath: 'rideId' });
@@ -55,205 +49,270 @@ function openDb() {
       if (!db.objectStoreNames.contains('RoughnessMap'))
         db.createObjectStore('RoughnessMap',{keyPath:'geoId'});
     };
-    req.onsuccess = e => { db = e.target.result; resolve(db); loadPastRides(); };
-    req.onerror   = e => { console.error(e); statusDiv.textContent='DB error'; reject(e); };
+    request.onsuccess = e => {
+      db = e.target.result;
+      resolve(db);
+      loadPastRides();
+    };
+    request.onerror = e => {
+      console.error('DB error', e);
+      statusDiv.textContent = 'Error opening database.';
+      reject(e);
+    };
   });
 }
 
+// --- Map Initialization ---
 function initializeMap() {
   if (mapInitialized) return;
-  map = L.map('map').setView([51.0447,-114.0719],13);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution:'&copy; OSM' }).addTo(map);
-  setTimeout(()=>map.invalidateSize(),200);
+  map = L.map('map').setView([51.0447, -114.0719], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+  setTimeout(() => map.invalidateSize(), 200);
   historicalRoughnessLayer = L.layerGroup().addTo(map);
-  currentRidePath        = L.polyline([], { weight:5 }).addTo(map);
+  currentRidePath = L.polyline([], { weight: 5 }).addTo(map);
   mapInitialized = true;
 }
 
+// --- Chart Initialization (live) ---
 function initChart() {
-  const ctx = document.getElementById('vibrationChart').getContext('2d');
+  const ctx = document.getElementById('vibrationChart')?.getContext('2d');
+  if (!ctx) return;
   vibrationChart = new Chart(ctx, {
     type: 'line',
-    data: {
-      datasets: [{
-        label: 'Road vibration',
-        data: chartDataset,
-        pointRadius: 4,
-        borderWidth: 2,
-        tension: 0.3
-      }]
-    },
+    data: { datasets: [{ label: 'Vibration', data: chartDataset, pointRadius:4, borderWidth:2, tension:0.3 }] },
     options: {
-      parsing: { xAxisKey: 'x', yAxisKey: 'y' },
+      parsing: { xAxisKey:'x', yAxisKey:'y' },
       scales: {
-        x: { type: 'time', time: { tooltipFormat: 'HH:mm:ss' } },
-        y: { beginAtZero: true }
+        x: { type:'time', time:{ tooltipFormat:'HH:mm:ss' } },
+        y: { beginAtZero:true }
       },
       plugins: {
         tooltip: {
           callbacks: {
             label: ctx => `Roughness: ${ctx.parsed.y.toFixed(2)}`,
             afterBody: ctx => {
-              const idx = ctx[0].dataIndex;
-              const dp  = chartDataset[idx].meta;
+              const dp = chartDataset[ctx[0].dataIndex].meta;
               return `Lat: ${dp.latitude.toFixed(5)}, Lon: ${dp.longitude.toFixed(5)}`;
             }
           }
         }
       },
-      onHover: (evt,items) => {
-        if (items.length) highlightPointOnMap(items[0].dataIndex);
-      }
+      onHover: (_, items) => { if (items.length) highlightPointOnMap(items[0].dataIndex); }
     }
   });
 }
 
+// --- Recap Map & Chart Inits ---
+function initRecapMap() {
+  if (recapMap) recapMap.remove();
+  recapMap = L.map('recapMap').setView([51.0447, -114.0719], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(recapMap);
+  setTimeout(() => recapMap.invalidateSize(), 200);
+  recapHistoricalLayer = L.layerGroup().addTo(recapMap);
+  recapRidePath = L.polyline([], { weight:5 }).addTo(recapMap);
+}
+
+function initRecapChart() {
+  const ctx = document.getElementById('recapChart').getContext('2d');
+  if (recapChart) recapChart.destroy();
+  recapChart = new Chart(ctx, {
+    type: 'line',
+    data: { datasets: [{ label:'Vibration', data:[], pointRadius:4, borderWidth:2, tension:0.3 }] },
+    options: {
+      parsing: { xAxisKey:'x', yAxisKey:'y' },
+      scales: {
+        x: { type:'time', time:{ tooltipFormat:'HH:mm:ss' } },
+        y: { beginAtZero:true }
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: ctx => `Roughness: ${ctx.parsed.y.toFixed(2)}`,
+            afterBody: ctx => {
+              const dp = recapChart.data.datasets[0].data[ctx[0].dataIndex].meta;
+              return `Lat: ${dp.latitude.toFixed(5)}, Lon: ${dp.longitude.toFixed(5)}`;
+            }
+          }
+        }
+      },
+      onHover: (_, items) => { if (items.length) highlightRecapPointOnMap(items[0].dataIndex); }
+    }
+  });
+}
+
+// --- Utilities ---
 function calculateVariance(arr) {
   if (!arr.length) return 0;
-  const μ = arr.reduce((s,v)=>s+v,0)/arr.length;
-  return arr.reduce((s,v)=>s+(v-μ)**2,0)/arr.length;
+  const mean = arr.reduce((s,v)=>s+v,0)/arr.length;
+  return arr.reduce((s,v)=>s+(v-mean)**2,0)/arr.length;
 }
-
 function getGeoId(lat,lon,prec=4){ return `${lat.toFixed(prec)}_${lon.toFixed(prec)}`; }
-function toRad(d){return d*Math.PI/180;}
+function toRad(d){ return d*Math.PI/180; }
 function dist(lat1,lon1,lat2,lon2){
-  const R=6371e3,φ1=toRad(lat1),φ2=toRad(lat2),
-        dφ=toRad(lat2-lat1),dλ=toRad(lon2-lon1),
-        a=Math.sin(dφ/2)**2+Math.cos(φ1)*Math.cos(φ2)*Math.sin(dλ/2)**2;
-  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+  const R=6371e3, φ1=toRad(lat1), φ2=toRad(lat2),
+        dφ=toRad(lat2-lat1), dλ=toRad(lon2-lon1),
+        a=Math.sin(dφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(dλ/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
-
 function roughnessToColor(r){
   for(let i=0;i<ROUGH_THRESHOLDS.length;i++){
-    if(r<=ROUGH_THRESHOLDS[i])return ROUGH_COLORS[i];
+    if(r<=ROUGH_THRESHOLDS[i]) return ROUGH_COLORS[i];
   }
   return ROUGH_COLORS[ROUGH_COLORS.length-1];
 }
 
+// --- Sensor Callbacks ---
 function gpsSuccess(pos){ latestGpsPosition = pos; }
 function gpsError(err){
-  const m={1:'Permission denied',2:'Unavailable',3:'Timed out'};
-  statusDiv.textContent = m[err.code]||'GPS error';
+  const msgs = {1:'GPS permission denied.',2:'GPS unavailable.',3:'GPS timed out.'};
+  statusDiv.textContent = msgs[err.code]||'GPS error';
   if(err.code===1) stopRide();
 }
-
 function handleMotion(evt){
-  const z=evt.accelerationIncludingGravity?.z;
+  const z = evt.accelerationIncludingGravity?.z;
   if(typeof z==='number'){
     lastLowPassZ = HPF_ALPHA*lastLowPassZ + (1-HPF_ALPHA)*z;
     accelerometerBuffer.push(z - lastLowPassZ);
   }
 }
 
+// --- Data Processing Loop ---
 async function processCombinedDataPoint(){
-  if(!currentRideId||!latestGpsPosition){
-    statusDiv.textContent='Waiting GPS…'; return;
+  if(!currentRideId || !latestGpsPosition){
+    statusDiv.textContent = 'Waiting for GPS…'; return;
   }
   const {latitude,longitude,altitude,accuracy} = latestGpsPosition.coords;
-  const t = latestGpsPosition.timestamp;
-  const rough = calculateVariance(accelerometerBuffer);
-  accelerometerBuffer=[];
+  const timestamp = latestGpsPosition.timestamp;
+  const roughness = calculateVariance(accelerometerBuffer);
+  accelerometerBuffer = [];
 
-  const dp = { id:crypto.randomUUID(), rideId:currentRideId,
-               timestamp:t, latitude,longitude,altitude,accuracy,
-               roughnessValue:rough };
+  const dp = {
+    id: crypto.randomUUID(),
+    rideId: currentRideId,
+    timestamp, latitude, longitude, altitude, accuracy,
+    roughnessValue: roughness
+  };
 
   currentRideDataPoints.push(dp);
   dataPointsCounter.textContent = `Data Points: ${currentRideDataPoints.length}`;
   await updateRoughnessMap(dp);
   updateMapDisplay(dp);
 
-  // add to chart
-  const point = { x:new Date(t), y:rough, meta:dp };
-  chartDataset.push(point);
+  // live chart
+  const pt = { x:new Date(timestamp), y:roughness, meta:dp };
+  chartDataset.push(pt);
   vibrationChart.update();
 
-  statusDiv.textContent=`Lat ${latitude.toFixed(4)}, Lon ${longitude.toFixed(4)}, Rough ${rough.toFixed(2)}`;
+  statusDiv.textContent = `Lat ${latitude.toFixed(4)}, Lon ${longitude.toFixed(4)}, Rough ${roughness.toFixed(2)}`;
 }
 
+// --- RoughnessMap Management ---
 async function updateRoughnessMap(dp){
-  const tx = db.transaction('RoughnessMap','readwrite'),
-        store = tx.objectStore('RoughnessMap'),
-        all = await promisifiedDbRequest(store.getAll());
+  const tx = db.transaction('RoughnessMap','readwrite');
+  const store = tx.objectStore('RoughnessMap');
+  const all = await promisifiedDbRequest(store.getAll());
+  const match = all.find(pt => dist(pt.latitude,pt.longitude,dp.latitude,dp.longitude) <= PROXIMITY_RADIUS);
 
-  const match = all.find(pt=>dist(pt.latitude,pt.longitude,dp.latitude,dp.longitude)<=PROXIMITY_MATCH_RADIUS_M);
   if(match){
-    const upd={ ...match, latitude:dp.latitude,longitude:dp.longitude,
-                roughnessValue:dp.roughnessValue, lastUpdated:dp.timestamp };
-    await promisifiedDbRequest(store.put(upd));
+    const updated = {
+      ...match,
+      latitude: dp.latitude,
+      longitude: dp.longitude,
+      roughnessValue: dp.roughnessValue,
+      lastUpdated: dp.timestamp
+    };
+    await promisifiedDbRequest(store.put(updated));
   } else {
     await promisifiedDbRequest(store.put({
-      geoId:getGeoId(dp.latitude,dp.longitude),
-      latitude:dp.latitude, longitude:dp.longitude,
-      roughnessValue:dp.roughnessValue, lastUpdated:dp.timestamp
+      geoId: getGeoId(dp.latitude,dp.longitude),
+      latitude: dp.latitude,
+      longitude: dp.longitude,
+      roughnessValue: dp.roughnessValue,
+      lastUpdated: dp.timestamp
     }));
   }
   await tx.complete;
 }
 
+// --- Map Rendering (live) ---
 function updateMapDisplay(dp){
-  const latlng=[dp.latitude,dp.longitude];
-  if(!currentLocationMarker) currentLocationMarker=L.marker(latlng).addTo(map);
+  const latlng = [dp.latitude, dp.longitude];
+  if(!currentLocationMarker) currentLocationMarker = L.marker(latlng).addTo(map);
   else                         currentLocationMarker.setLatLng(latlng);
-  map.setView(latlng,Math.max(map.getZoom(),15));
+  map.setView(latlng, Math.max(map.getZoom(),15));
 
   const path = currentRidePath.getLatLngs();
   const col  = roughnessToColor(dp.roughnessValue);
   if(path.length){
     const prev = path[path.length-1];
     L.polyline([prev,latlng],{color:col,weight:5}).addTo(map);
-  } else {
-    L.polyline([latlng,latlng],{color:col,weight:5}).addTo(map);
   }
   currentRidePath.addLatLng(latlng);
-  updateHistoricalRoughnessDisplay(dp.latitude,dp.longitude);
+
+  // historical overlay
+  updateHistoricalDisplay(latlng[0],latlng[1], historicalRoughnessLayer, map);
 }
 
-async function updateHistoricalRoughnessDisplay(lat,lon){
-  historicalRoughnessLayer.clearLayers();
-  const tx = db.transaction('RoughnessMap','readonly'),
-        all = await promisifiedDbRequest(tx.objectStore('RoughnessMap').getAll());
-  all.forEach(pt=>{
-    if(dist(lat,lon,pt.latitude,pt.longitude)<=HISTORICAL_DISPLAY_RADIUS_M){
-      L.circleMarker([pt.latitude,pt.longitude],{
-        radius:4, fillColor:roughnessToColor(pt.roughnessValue),
-        color:'#000',weight:1,opacity:0.7,fillOpacity:0.7
-      }).bindPopup(
+// --- Historical Overlay Helper ---
+async function updateHistoricalDisplay(lat, lon, layerGroup, targetMap){
+  layerGroup.clearLayers();
+  const tx = db.transaction('RoughnessMap','readonly');
+  const all = await promisifiedDbRequest(tx.objectStore('RoughnessMap').getAll());
+  all.forEach(pt => {
+    if(dist(lat,lon,pt.latitude,pt.longitude) <= HIST_RADIUS){
+      L.circleMarker([pt.latitude,pt.longitude], {
+        radius:4,
+        fillColor: roughnessToColor(pt.roughnessValue),
+        color:'#000', weight:1, opacity:0.7, fillOpacity:0.7
+      })
+      .bindPopup(
         `Roughness: ${pt.roughnessValue.toFixed(2)}<br>`+
         `Updated: ${new Date(pt.lastUpdated).toLocaleDateString()}`
-      ).addTo(historicalRoughnessLayer);
+      )
+      .addTo(layerGroup);
     }
   });
   await tx.complete;
 }
 
-// highlight a chart‑hovered point on map
-let highlightMarker = null;
+// --- Highlight on hover ---
 function highlightPointOnMap(idx){
   const dp = chartDataset[idx].meta;
-  if(highlightMarker) map.removeLayer(highlightMarker);
-  highlightMarker = L.circleMarker([dp.latitude,dp.longitude],{
+  if(recapHighlight) map.removeLayer(recapHighlight);
+  recapHighlight = L.circleMarker([dp.latitude,dp.longitude], {
     radius:10, color:'#ff0000', weight:2, fill:false
   }).addTo(map);
-  setTimeout(()=>{ map.removeLayer(highlightMarker); highlightMarker=null; }, 3000);
+  setTimeout(() => map.removeLayer(recapHighlight), 3000);
+}
+function highlightRecapPointOnMap(idx){
+  const dp = recapChart.data.datasets[0].data[idx].meta;
+  if(recapHighlight) recapMap.removeLayer(recapHighlight);
+  recapHighlight = L.circleMarker([dp.latitude,dp.longitude], {
+    radius:10, color:'#ff0000', weight:2, fill:false
+  }).addTo(recapMap);
+  setTimeout(() => recapMap.removeLayer(recapHighlight), 3000);
 }
 
-// --- Start / Stop Ride ---
+// --- Start & Stop ---
 async function startRide(){
   if(currentRideId) return;
   currentRideId = Date.now();
   currentRideDataPoints = [];
   accelerometerBuffer = [];
   latestGpsPosition = null;
-  dataPointsCounter.textContent='Data Points: 0';
-  statusDiv.textContent='Requesting permissions…';
+  dataPointsCounter.textContent = 'Data Points: 0';
+  statusDiv.textContent = 'Requesting permissions…';
 
   if(currentRidePath) map.removeLayer(currentRidePath);
   currentRidePath = L.polyline([], { weight:5 }).addTo(map);
   if(currentLocationMarker) map.removeLayer(currentLocationMarker);
   historicalRoughnessLayer.clearLayers();
 
-  watchId = navigator.geolocation.watchPosition(gpsSuccess, gpsError,{
+  watchId = navigator.geolocation.watchPosition(gpsSuccess, gpsError, {
     enableHighAccuracy:true, timeout:10000, maximumAge:0
   });
 
@@ -261,34 +320,41 @@ async function startRide(){
     try{
       const resp = await DeviceMotionEvent.requestPermission();
       if(resp==='granted'){
-        window.addEventListener('devicemotion',handleMotion);
+        window.addEventListener('devicemotion', handleMotion);
         motionListenerActive = true;
-      } else statusDiv.textContent='Motion denied.';
+      } else {
+        statusDiv.textContent = 'Motion permission denied.';
+      }
     }catch(e){
-      console.error(e); statusDiv.textContent='Motion error.';
+      console.error(e);
+      statusDiv.textContent = 'Error requesting motion permission.';
     }
   } else {
-    window.addEventListener('devicemotion',handleMotion);
+    window.addEventListener('devicemotion', handleMotion);
     motionListenerActive = true;
   }
 
-  dataCollectionInterval = setInterval(processCombinedDataPoint, DATA_COLLECTION_INTERVAL_MS);
+  dataCollectionInterval = setInterval(processCombinedDataPoint, DATA_INTERVAL_MS);
 
   const tx = db.transaction('rides','readwrite');
   await promisifiedDbRequest(tx.objectStore('rides').add({
-    rideId:currentRideId,startTime:currentRideId,
-    endTime:null,duration:0,totalDataPoints:0,status:'active'
+    rideId: currentRideId,
+    startTime: currentRideId,
+    endTime: null,
+    duration: 0,
+    totalDataPoints: 0,
+    status: 'active'
   }));
   await tx.complete;
 
-  // clear chart
+  // reset live chart
   chartDataset.length = 0;
   vibrationChart.data.datasets[0].data = chartDataset;
   vibrationChart.update();
 
   startButton.disabled = true;
   stopButton.disabled = false;
-  statusDiv.textContent='Recording… waiting for GPS.';
+  statusDiv.textContent = 'Recording… waiting for GPS.';
 }
 
 async function stopRide(){
@@ -297,109 +363,138 @@ async function stopRide(){
   if(motionListenerActive){ window.removeEventListener('devicemotion',handleMotion); motionListenerActive=false; }
   if(dataCollectionInterval!==null){ clearInterval(dataCollectionInterval); dataCollectionInterval=null; }
 
-  statusDiv.textContent='Saving ride…';
+  statusDiv.textContent = 'Saving ride…';
   try{
     const tx = db.transaction(['rides','rideDataPoints'],'readwrite'),
           ridesStore = tx.objectStore('rides'),
           dpStore    = tx.objectStore('rideDataPoints');
-    for(const dp of currentRideDataPoints) await promisifiedDbRequest(dpStore.put(dp));
+    for(const dp of currentRideDataPoints){
+      await promisifiedDbRequest(dpStore.put(dp));
+    }
     const rr = await promisifiedDbRequest(ridesStore.get(currentRideId));
-    const upd = { ...rr,
-      endTime:Date.now(),
-      duration:Math.floor((Date.now()-rr.startTime)/1000),
-      totalDataPoints:currentRideDataPoints.length,
-      status:'completed'
+    const upd = {
+      ...rr,
+      endTime: Date.now(),
+      duration: Math.floor((Date.now() - rr.startTime)/1000),
+      totalDataPoints: currentRideDataPoints.length,
+      status: 'completed'
     };
     await promisifiedDbRequest(ridesStore.put(upd));
     await tx.complete;
-    statusDiv.textContent='Ride saved!';
-  }catch(e){
-    console.error(e); statusDiv.textContent='Save error.';
+    statusDiv.textContent = 'Ride saved!';
+  } catch(e){
+    console.error(e);
+    statusDiv.textContent = 'Error saving ride.';
   }
 
   currentRideId = null;
   currentRideDataPoints = [];
   accelerometerBuffer = [];
   latestGpsPosition = null;
-  startButton.disabled=false;
-  stopButton.disabled=true;
-  dataPointsCounter.textContent='Data Points: 0';
+  startButton.disabled = false;
+  stopButton.disabled = true;
+  dataPointsCounter.textContent = 'Data Points: 0';
   if(currentRidePath) currentRidePath.setLatLngs([]);
   if(currentLocationMarker) map.removeLayer(currentLocationMarker);
   historicalRoughnessLayer.clearLayers();
+
   loadPastRides();
 }
 
-// --- Past Rides UI ---
+// --- Past Rides & Recap ---
 async function loadPastRides(){
   pastRidesList.innerHTML = '';
   if(!db) return;
   try{
     const all = await promisifiedDbRequest(db.transaction('rides','readonly').objectStore('rides').getAll());
     if(!all.length){
-      pastRidesList.innerHTML='<li>No past rides.</li>';
+      pastRidesList.innerHTML = '<li>No past rides recorded.</li>';
       return;
     }
-    all.sort((a,b)=>b.startTime - a.startTime).forEach(r=>{
-      const li=document.createElement('li');
-      const start=new Date(r.startTime).toLocaleString(),
-            m=Math.floor(r.duration/60), s=r.duration%60;
-      li.innerHTML=`<strong>Start:</strong> ${start}<br>` +
-                   `<strong>Dur:</strong> ${m}m ${s}s<br>` +
-                   `<strong>Pts:</strong> ${r.totalDataPoints}`;
-      li.onclick=() => showRideDetails(r.rideId);
+    all.sort((a,b)=>b.startTime - a.startTime).forEach(r => {
+      const li = document.createElement('li');
+      const start = new Date(r.startTime).toLocaleString();
+      const m = Math.floor(r.duration/60), s = r.duration%60;
+      li.innerHTML = `
+        <strong>Start:</strong> ${start}<br>
+        <strong>Duration:</strong> ${m}m ${s}s<br>
+        <strong>Points:</strong> ${r.totalDataPoints}
+      `;
+      li.onclick = () => showRideDetails(r.rideId);
       pastRidesList.appendChild(li);
     });
   }catch(e){
-    console.error(e); statusDiv.textContent='Load rides error.';
+    console.error(e);
+    statusDiv.textContent = 'Error loading past rides.';
   }
 }
 
 async function showRideDetails(rideId){
   rideDetailView.classList.remove('hidden');
-  detailContent.textContent='Loading…';
-  try{
-    const tx = db.transaction(['rides','rideDataPoints'],'readonly'),
-          rr = await promisifiedDbRequest(tx.objectStore('rides').get(rideId)),
-          dps = await promisifiedDbRequest(tx.objectStore('rideDataPoints').index('by_rideId').getAll(rideId));
-    await tx.complete;
-    if(!rr||!dps.length){
-      detailContent.textContent='No data'; return;
-    }
+  detailContent.textContent = 'Loading…';
 
-    // populate chart & map for playback
-    chartDataset.length=0;
-    dps.forEach(dp=>{
-      chartDataset.push({ x:new Date(dp.timestamp), y:dp.roughnessValue, meta:dp });
-    });
-    vibrationChart.update();
+  initRecapMap();
+  initRecapChart();
 
-    // clear live path & redraw historical segment
-    if(currentRidePath) map.removeLayer(currentRidePath);
-    currentRidePath = L.polyline([], { weight:5 }).addTo(map);
-    dps.forEach(dp => updateMapDisplay(dp));
+  const tx = db.transaction(['rides','rideDataPoints'],'readonly');
+  const rideRec = await promisifiedDbRequest(tx.objectStore('rides').get(rideId));
+  const dps     = await promisifiedDbRequest(
+    tx.objectStore('rideDataPoints').index('by_rideId').getAll(rideId)
+  );
+  await tx.complete;
 
-    // fill detail panel
-    let txt=`Ride ID: ${rr.rideId}\nStart: ${new Date(rr.startTime).toLocaleString()}\n`+
-            `End: ${new Date(rr.endTime).toLocaleDateString()} ${new Date(rr.endTime).toLocaleTimeString()}\n`+
-            `Duration: ${Math.floor(rr.duration/60)}m ${rr.duration%60}s\nPoints: ${rr.totalDataPoints}\n\n—Data Points—\n`;
-    dps.forEach(dp=>{
-      txt+=`${new Date(dp.timestamp).toLocaleTimeString()} | `+
-           `Lat ${dp.latitude.toFixed(5)}, Lon ${dp.longitude.toFixed(5)} | `+
-           `Rough ${dp.roughnessValue.toFixed(3)}\n`;
-    });
-    detailContent.textContent = txt;
-  }catch(e){
-    console.error(e); detailContent.textContent='Error loading details.';
+  if(!rideRec || !dps.length){
+    detailContent.textContent = 'No data for this ride.';
+    return;
   }
+
+  // Populate recap chart
+  const data = dps.map(dp => ({
+    x: new Date(dp.timestamp),
+    y: dp.roughnessValue,
+    meta: dp
+  }));
+  recapChart.data.datasets[0].data = data;
+  recapChart.update();
+
+  // Populate recap map
+  recapRidePath.setLatLngs([]);
+  recapHistoricalLayer.clearLayers();
+  dps.forEach(dp => {
+    const latlng = [dp.latitude, dp.longitude];
+    const pts = recapRidePath.getLatLngs();
+    const col = roughnessToColor(dp.roughnessValue);
+    if(pts.length){
+      const prev = pts[pts.length-1];
+      L.polyline([prev, latlng], { color: col, weight: 5 }).addTo(recapMap);
+    }
+    recapRidePath.addLatLng(latlng);
+  });
+  // add historical around final point
+  const last = dps[dps.length-1];
+  updateHistoricalDisplay(last.latitude, last.longitude, recapHistoricalLayer, recapMap);
+
+  // Fill textual details
+  let txt = `Ride ID: ${rideRec.rideId}\n`
+          + `Start: ${new Date(rideRec.startTime).toLocaleString()}\n`
+          + `End: ${new Date(rideRec.endTime).toLocaleString()}\n`
+          + `Duration: ${Math.floor(rideRec.duration/60)}m ${rideRec.duration%60}s\n`
+          + `Points: ${rideRec.totalDataPoints}\n\n— Data Points —\n`;
+  dps.forEach(dp => {
+    txt += `${new Date(dp.timestamp).toLocaleTimeString()} | `
+         + `Lat ${dp.latitude.toFixed(5)}, Lon ${dp.longitude.toFixed(5)} | `
+         + `Rough ${dp.roughnessValue.toFixed(3)}\n`;
+  });
+  detailContent.textContent = txt;
 }
+
 function hideRideDetails(){
   rideDetailView.classList.add('hidden');
-  detailContent.textContent='';
+  detailContent.textContent = '';
 }
 
-// --- Init on load ---
-document.addEventListener('DOMContentLoaded', ()=>{
+// --- Bootstrapping ---
+document.addEventListener('DOMContentLoaded', () => {
   statusDiv         = document.getElementById('status');
   startButton       = document.getElementById('startButton');
   stopButton        = document.getElementById('stopButton');
