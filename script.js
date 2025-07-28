@@ -470,6 +470,22 @@ async function showRideDetails(rideId) {
     detailContent.textContent = 'No data for this ride.';
     return;
   }
+  
+  // 1) Sort by time
+  dps.sort((a, b) => a.timestamp - b.timestamp);
+  
+  // 2) Build the chart data
+  const chartData = dps.map(dp => ({
+    x: new Date(dp.timestamp),
+    y: dp.roughnessValue,
+    meta: dp
+  }));
+  
+  // 3) Update recap chart
+  if (recapChart) {
+    recapChart.data.datasets[0].data = chartData;
+    recapChart.update();
+  }
 
   // Recap chart
   const data = dps.map(dp => ({ x: new Date(dp.timestamp), y: dp.roughnessValue, meta: dp }));
