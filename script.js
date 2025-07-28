@@ -21,6 +21,21 @@ let closeDetailButton;
 const DB_NAME = 'BikeRoughnessDB';
 const DB_VERSION = 1;
 
+// --- IndexedDB Helper Function ---
+// This function wraps an IDBRequest into a Promise,
+// ensuring it resolves with event.target.result on success
+// and rejects with event.target.error on error.
+function promisifiedDbRequest(request) {
+    return new Promise((resolve, reject) => {
+        request.onsuccess = (event) => {
+            resolve(event.target.result);
+        };
+        request.onerror = (event) => {
+            reject(event.target.error);
+        };
+    });
+}
+
 // --- IndexedDB Initialization ---
 function openDb() {
     return new Promise((resolve, reject) => {
@@ -176,18 +191,14 @@ async function startRide() {
         // Save initial ride entry to IndexedDB
         const transaction = db.transaction(['rides'], 'readwrite');
         const store = transaction.objectStore('rides');
-        await new Promise((resolve, reject) => { // Use Promise wrapper for robust awaiting of IDBRequest
-            const request = store.add({
-                rideId: currentRideId,
-                startTime: currentRideId,
-                endTime: null,
-                duration: 0,
-                totalDataPoints: 0,
-                status: 'active'
-            });
-            request.onsuccess = () => resolve();
-            request.onerror = (event) => reject(event.target.error);
-        });
+        await promisifiedDbRequest(store.add({ // Use the helper
+            rideId: currentRideId,
+            startTime: currentRideId,
+            endTime: null,
+            duration: 0,
+            totalDataPoints: 0,
+            status: 'active'
+        }));
         await transaction.complete; // Wait for transaction to complete
 
         startButton.disabled = true;
@@ -237,26 +248,17 @@ async function stopRide() {
 
         // Add all collected data points to IndexedDB
         for (const dp of currentRideDataPoints) {
-            await new Promise((resolve, reject) => { // Use Promise wrapper for robust awaiting of IDBRequest
-                const request = dataPointsStore.put(dp);
-                request.onsuccess = () => resolve();
-                request.onerror = (event) => reject(event.target.error);
-            });
+            await promisifiedDbRequest(dataPointsStore.put(dp)); // Use the helper
         }
 
         // Update the ride summary
-        const getExistingRideRequest = ridesStore.get(currentRideId);
-        const existingRide = await new Promise((resolve, reject) => {
-            getExistingRideRequest.onsuccess = (event) => resolve(event.target.result);
-            getExistingRideRequest.onerror = (event) => reject(event.target.error);
-        });
+        const existingRide = await promisifiedDbRequest(ridesStore.get(currentRideId));
        
         if (existingRide) {
             // *** CRITICAL FIX FOR DATACLONEERROR & DataError ***
-            // Ensure the object has the keyPath property and is a new, detached object.
             // Explicitly create a new object and assign properties, ensuring 'rideId' is there.
             const rideToUpdate = {
-                rideId: existingRide.rideId, // Ensure rideId is copied
+                rideId: existingRide.rideId, // Ensure rideId is copied from the fetched object
                 startTime: existingRide.startTime,
                 endTime: Date.now(),
                 duration: Math.floor((Date.now() - existingRide.startTime) / 1000), // in seconds
@@ -264,17 +266,14 @@ async function stopRide() {
                 status: 'completed'
             };
 
-            // Verify rideId exists on the object to be stored
+            // Verify rideId exists on the object to be stored,
+            // this handles the "key path did not yield a value" DataError.
             if (typeof rideToUpdate.rideId === 'undefined' || rideToUpdate.rideId === null) {
                 console.error("Error: rideId is missing or null for object to be stored.", rideToUpdate);
                 throw new Error("Cannot save ride: rideId is missing.");
             }
 
-            await new Promise((resolve, reject) => { // Use Promise wrapper for robust awaiting of IDBRequest
-                const putRequest = ridesStore.put(rideToUpdate); // Use the new, clean object for 'put'
-                putRequest.onsuccess = () => resolve();
-                putRequest.onerror = (event) => reject(event.target.error);
-            });
+            await promisifiedDbRequest(ridesStore.put(rideToUpdate)); // Use the helper
         }
         await transaction.complete; // Wait for transaction to complete
 
@@ -309,18 +308,14 @@ async function loadPastRides() {
         const store = transaction.objectStore('rides');
         
         // *** CRITICAL FIX FOR .sort IS NOT A FUNCTION ***
-        // Use the IDBRequest pattern to explicitly get the result
-        const request = store.getAll();
-        const allRides = await new Promise((resolve, reject) => {
-            request.onsuccess = (event) => resolve(event.target.result);
-            request.onerror = (event) => reject(event.target.error);
-        });
+        // Use the promisified helper to ensure we get the actual result array.
+        const allRides = await promisifiedDbRequest(store.getAll()); 
         
         await transaction.complete; // Ensure transaction completes after getting data
 
         // Explicitly check if it's an array for maximum robustness
         if (!Array.isArray(allRides)) {
-            console.error('store.getAll() did not return an array:', allRides);
+            console.error('store.getAll() did not return an array despite promisified request:', allRides);
             statusDiv.textContent = 'Error: Unexpected data type for past rides.';
             return; // Exit if not an array
         }
@@ -366,17 +361,8 @@ async function showRideDetails(rideId) {
         const dataPointsStore = transaction.objectStore('rideDataPoints');
         const rideIndex = dataPointsStore.index('by_rideId');
 
-        const rideRequest = ridesStore.get(rideId);
-        const dataPointsRequest = rideIndex.getAll(rideId);
-
-        const ride = await new Promise((resolve, reject) => {
-            rideRequest.onsuccess = (event) => resolve(event.target.result);
-            rideRequest.onerror = (event) => reject(event.target.error);
-        });
-        const dataPoints = await new Promise((resolve, reject) => {
-            dataPointsRequest.onsuccess = (event) => resolve(event.target.result);
-            dataPointsRequest.onerror = (event) => reject(event.target.error);
-        });
+        const ride = await promisifiedDbRequest(ridesStore.get(rideId));
+        const dataPoints = await promisifiedDbRequest(rideIndex.getAll(rideId));
 
         await transaction.complete;
 
