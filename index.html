@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Bike Road Roughness Recorder</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha512-xodZBNTC5n17Xt2atTPuHjQjWlqVwJg3t1Qj6zLqU/eXQ8iR+Fq09y4rK1aG/vYkP+w=="
+          crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha512-xodZBNTC5n17Xt2atTPuHjQjWlqVwJg3t1Qj6zLqU/eXQ8iR+Fq09y4rK1aG/vYkP+w=="
+            crossorigin=""></script>
+</head>
+<body>
+
+    <div id="app">
+        <h1>Bike Road Roughness Recorder</h1>
+
+        <button id="startStopButton">Start Recording</button>
+        <p id="status">Ready</p>
+
+        <div id="map"></div>  <!-- Map will be rendered here -->
+
+        <div id="roughnessDisplay">Roughness: <span id="roughnessValue">N/A</span></div>
+
+        <div id="reportSection">
+            <h2>Report</h2>
+            <ul id="reportList"></ul>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
