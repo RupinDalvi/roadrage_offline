@@ -168,7 +168,7 @@ async function startRide() {
             motionListenerActive = true;
             console.log('DeviceMotion listener attached.');
         } else {
-            console.warn('DeviceMotionEvent not supported on this device/browser.');
+            console.warn('DeviceMotionEvent not supported on this device/browser. Roughness data may not be recorded.');
             statusDiv.textContent = 'Device motion not supported. Roughness data may not be recorded.';
         }
 
@@ -233,32 +233,26 @@ async function stopRide() {
 
         // Add all collected data points to IndexedDB
         for (const dp of currentRideDataPoints) {
-            await dataPointsStore.add(dp);
+            // Use put instead of add to handle potential duplicate IDs more gracefully,
+            // though with crypto.randomUUID it's unlikely. Add might throw error on duplicate.
+            await dataPointsStore.put(dp); 
         }
 
         // Update the ride summary
-        const existingRideRequest = ridesStore.get(currentRideId);
-        const existingRide = await new Promise((resolve, reject) => {
-            existingRideRequest.onsuccess = (event) => resolve(event.target.result);
-            existingRideRequest.onerror = (event) => reject(event.target.error);
-        });
-
+        const existingRide = await ridesStore.get(currentRideId);
+       
         if (existingRide) {
-            // Explicitly create a new plain object to avoid DataCloneError
-            const rideToUpdate = {
-                rideId: existingRide.rideId,
-                startTime: existingRide.startTime,
-                endTime: Date.now(),
-                duration: Math.floor((Date.now() - existingRide.startTime) / 1000), // in seconds
-                totalDataPoints: currentRideDataPoints.length,
-                status: 'completed'
-            };
+            // *** CRITICAL FIX FOR DATACLONEERROR ***
+            // Perform a deep copy to ensure the object is completely detached and cloneable.
+            // This is safer than shallow copy for IndexedDB re-insertion.
+            const rideToUpdate = JSON.parse(JSON.stringify(existingRide));
 
-            const putRequest = ridesStore.put(rideToUpdate);
-            await new Promise((resolve, reject) => {
-                putRequest.onsuccess = () => resolve();
-                putRequest.onerror = (event) => reject(event.target.error);
-            });
+            rideToUpdate.endTime = Date.now();
+            rideToUpdate.duration = Math.floor((rideToUpdate.endTime - rideToUpdate.startTime) / 1000); // in seconds
+            rideToUpdate.totalDataPoints = currentRideDataPoints.length;
+            rideToUpdate.status = 'completed';
+            
+            await ridesStore.put(rideToUpdate); // Use the new, deep-cloned object for 'put'
         }
         await transaction.complete; // Wait for transaction to complete
 
@@ -292,18 +286,23 @@ async function loadPastRides() {
         const transaction = db.transaction(['rides'], 'readonly');
         const store = transaction.objectStore('rides');
         
-        // Use explicit request.onsuccess to get the result as an Array
-        const request = store.getAll();
-        const allRides = await new Promise((resolve, reject) => {
-            request.onsuccess = (event) => resolve(event.target.result);
-            request.onerror = (event) => reject(event.target.error);
-        });
+        // *** CRITICAL FIX FOR .sort IS NOT A FUNCTION ***
+        // Await the result of the getAll() directly. In modern IndexedDB,
+        // this typically resolves to a true Array.
+        const allRides = await store.getAll(); 
         
-        await transaction.complete; // Ensure transaction completes
+        // Explicitly check if it's an array for maximum robustness
+        if (!Array.isArray(allRides)) {
+            console.error('store.getAll() did not return an array:', allRides);
+            statusDiv.textContent = 'Error: Unexpected data type for past rides.';
+            return; // Exit if not an array
+        }
 
-        if (!Array.isArray(allRides) || allRides.length === 0) {
+        await transaction.complete; // Ensure transaction completes after getting data
+
+        if (allRides.length === 0) {
             pastRidesList.innerHTML = '<li class="text-center text-gray-500">No past rides recorded.</li>';
-            console.log('No past rides found or allRides is not an array:', allRides);
+            console.log('No past rides found.');
             return;
         }
 
@@ -342,17 +341,8 @@ async function showRideDetails(rideId) {
         const dataPointsStore = transaction.objectStore('rideDataPoints');
         const rideIndex = dataPointsStore.index('by_rideId');
 
-        const rideRequest = ridesStore.get(rideId);
-        const dataPointsRequest = rideIndex.getAll(rideId);
-
-        const ride = await new Promise((resolve, reject) => {
-            rideRequest.onsuccess = (event) => resolve(event.target.result);
-            rideRequest.onerror = (event) => reject(event.target.error);
-        });
-        const dataPoints = await new Promise((resolve, reject) => {
-            dataPointsRequest.onsuccess = (event) => resolve(event.target.result);
-            dataPointsRequest.onerror = (event) => reject(event.target.error);
-        });
+        const ride = await ridesStore.get(rideId);
+        const dataPoints = await rideIndex.getAll(rideId);
 
         await transaction.complete;
 
