@@ -176,13 +176,17 @@ async function startRide() {
         // Save initial ride entry to IndexedDB
         const transaction = db.transaction(['rides'], 'readwrite');
         const store = transaction.objectStore('rides');
-        await store.add({
-            rideId: currentRideId,
-            startTime: currentRideId,
-            endTime: null,
-            duration: 0,
-            totalDataPoints: 0,
-            status: 'active'
+        await new Promise((resolve, reject) => { // Use Promise wrapper for robust awaiting of IDBRequest
+            const request = store.add({
+                rideId: currentRideId,
+                startTime: currentRideId,
+                endTime: null,
+                duration: 0,
+                totalDataPoints: 0,
+                status: 'active'
+            });
+            request.onsuccess = () => resolve();
+            request.onerror = (event) => reject(event.target.error);
         });
         await transaction.complete; // Wait for transaction to complete
 
@@ -233,26 +237,44 @@ async function stopRide() {
 
         // Add all collected data points to IndexedDB
         for (const dp of currentRideDataPoints) {
-            // Use put instead of add to handle potential duplicate IDs more gracefully,
-            // though with crypto.randomUUID it's unlikely. Add might throw error on duplicate.
-            await dataPointsStore.put(dp); 
+            await new Promise((resolve, reject) => { // Use Promise wrapper for robust awaiting of IDBRequest
+                const request = dataPointsStore.put(dp);
+                request.onsuccess = () => resolve();
+                request.onerror = (event) => reject(event.target.error);
+            });
         }
 
         // Update the ride summary
-        const existingRide = await ridesStore.get(currentRideId);
+        const getExistingRideRequest = ridesStore.get(currentRideId);
+        const existingRide = await new Promise((resolve, reject) => {
+            getExistingRideRequest.onsuccess = (event) => resolve(event.target.result);
+            getExistingRideRequest.onerror = (event) => reject(event.target.error);
+        });
        
         if (existingRide) {
-            // *** CRITICAL FIX FOR DATACLONEERROR ***
-            // Perform a deep copy to ensure the object is completely detached and cloneable.
-            // This is safer than shallow copy for IndexedDB re-insertion.
-            const rideToUpdate = JSON.parse(JSON.stringify(existingRide));
+            // *** CRITICAL FIX FOR DATACLONEERROR & DataError ***
+            // Ensure the object has the keyPath property and is a new, detached object.
+            // Explicitly create a new object and assign properties, ensuring 'rideId' is there.
+            const rideToUpdate = {
+                rideId: existingRide.rideId, // Ensure rideId is copied
+                startTime: existingRide.startTime,
+                endTime: Date.now(),
+                duration: Math.floor((Date.now() - existingRide.startTime) / 1000), // in seconds
+                totalDataPoints: currentRideDataPoints.length,
+                status: 'completed'
+            };
 
-            rideToUpdate.endTime = Date.now();
-            rideToUpdate.duration = Math.floor((rideToUpdate.endTime - rideToUpdate.startTime) / 1000); // in seconds
-            rideToUpdate.totalDataPoints = currentRideDataPoints.length;
-            rideToUpdate.status = 'completed';
-            
-            await ridesStore.put(rideToUpdate); // Use the new, deep-cloned object for 'put'
+            // Verify rideId exists on the object to be stored
+            if (typeof rideToUpdate.rideId === 'undefined' || rideToUpdate.rideId === null) {
+                console.error("Error: rideId is missing or null for object to be stored.", rideToUpdate);
+                throw new Error("Cannot save ride: rideId is missing.");
+            }
+
+            await new Promise((resolve, reject) => { // Use Promise wrapper for robust awaiting of IDBRequest
+                const putRequest = ridesStore.put(rideToUpdate); // Use the new, clean object for 'put'
+                putRequest.onsuccess = () => resolve();
+                putRequest.onerror = (event) => reject(event.target.error);
+            });
         }
         await transaction.complete; // Wait for transaction to complete
 
@@ -287,18 +309,21 @@ async function loadPastRides() {
         const store = transaction.objectStore('rides');
         
         // *** CRITICAL FIX FOR .sort IS NOT A FUNCTION ***
-        // Await the result of the getAll() directly. In modern IndexedDB,
-        // this typically resolves to a true Array.
-        const allRides = await store.getAll(); 
+        // Use the IDBRequest pattern to explicitly get the result
+        const request = store.getAll();
+        const allRides = await new Promise((resolve, reject) => {
+            request.onsuccess = (event) => resolve(event.target.result);
+            request.onerror = (event) => reject(event.target.error);
+        });
         
+        await transaction.complete; // Ensure transaction completes after getting data
+
         // Explicitly check if it's an array for maximum robustness
         if (!Array.isArray(allRides)) {
             console.error('store.getAll() did not return an array:', allRides);
             statusDiv.textContent = 'Error: Unexpected data type for past rides.';
             return; // Exit if not an array
         }
-
-        await transaction.complete; // Ensure transaction completes after getting data
 
         if (allRides.length === 0) {
             pastRidesList.innerHTML = '<li class="text-center text-gray-500">No past rides recorded.</li>';
@@ -341,8 +366,17 @@ async function showRideDetails(rideId) {
         const dataPointsStore = transaction.objectStore('rideDataPoints');
         const rideIndex = dataPointsStore.index('by_rideId');
 
-        const ride = await ridesStore.get(rideId);
-        const dataPoints = await rideIndex.getAll(rideId);
+        const rideRequest = ridesStore.get(rideId);
+        const dataPointsRequest = rideIndex.getAll(rideId);
+
+        const ride = await new Promise((resolve, reject) => {
+            rideRequest.onsuccess = (event) => resolve(event.target.result);
+            rideRequest.onerror = (event) => reject(event.target.error);
+        });
+        const dataPoints = await new Promise((resolve, reject) => {
+            dataPointsRequest.onsuccess = (event) => resolve(event.target.result);
+            dataPointsRequest.onerror = (event) => reject(event.target.error);
+        });
 
         await transaction.complete;
 
