@@ -31,11 +31,13 @@ function openDb() {
             // Create object stores if they don't exist
             if (!db.objectStoreNames.contains('rides')) {
                 db.createObjectStore('rides', { keyPath: 'rideId' });
+                console.log('Object store "rides" created.');
             }
             if (!db.objectStoreNames.contains('rideDataPoints')) {
                 const dataPointsStore = db.createObjectStore('rideDataPoints', { keyPath: 'id' });
                 // Create an index on rideId for efficient querying
                 dataPointsStore.createIndex('by_rideId', 'rideId', { unique: false });
+                console.log('Object store "rideDataPoints" created.');
             }
             console.log('IndexedDB upgrade complete.');
         };
@@ -48,7 +50,7 @@ function openDb() {
         };
 
         request.onerror = (event) => {
-            console.error('IndexedDB error:', event.target.errorCode);
+            console.error('IndexedDB error:', event.target.errorCode, event);
             statusDiv.textContent = 'Error opening database.';
             reject(event.target.errorCode);
         };
@@ -78,11 +80,13 @@ function gpsSuccess(position) {
     const timeElapsed = timestamp - lastGpsTimestamp;
 
     if (timeElapsed >= 2000 || distanceMoved >= 5) { // 2 seconds or 5 meters
-        // Find the most recent roughness value from the buffer
         let roughnessValue = 0;
         if (accelerometerBuffer.length > 0) {
             roughnessValue = calculateVariance(accelerometerBuffer);
+            // console.log(`Processed ${accelerometerBuffer.length} accel points. Roughness: ${roughnessValue.toFixed(3)}`); // Debugging line
             accelerometerBuffer = []; // Clear buffer after processing
+        } else {
+            // console.log("Accelerometer buffer was empty when GPS point arrived."); // Debugging line
         }
 
         const dataPoint = {
@@ -119,18 +123,20 @@ function gpsError(error) {
     }
     statusDiv.textContent = errorMessage;
     console.error('GPS Error:', error);
-    // Do not automatically stop ride on all errors to allow recovery,
-    // but on PERMISSION_DENIED or if watchId is invalid, it should stop.
-    // For MVP, we'll keep the stopRide() call for now, but in a real app,
-    // you might want more nuanced error handling.
-    stopRide();
+    // Automatically stop ride on critical errors like permission denied
+    if (error.code === error.PERMISSION_DENIED) {
+        stopRide();
+    }
 }
 
 // DeviceMotion handler
 function handleMotion(event) {
     if (currentRideId && event.accelerationIncludingGravity) {
-        // Collect Z-axis acceleration data
-        accelerometerBuffer.push(event.accelerationIncludingGravity.z);
+        const z = event.accelerationIncludingGravity.z;
+        if (typeof z === 'number' && !isNaN(z)) { // Ensure it's a valid number
+             accelerometerBuffer.push(z);
+            //  console.log(`Accel Z: ${z.toFixed(2)} (Buffer size: ${accelerometerBuffer.length})`); // Debugging line
+        }
     }
 }
 
@@ -150,7 +156,6 @@ async function startRide() {
 
     try {
         // Request geolocation permission (watchPosition implicitly requests)
-        // Start watching position
         watchId = navigator.geolocation.watchPosition(gpsSuccess, gpsError, {
             enableHighAccuracy: true,
             timeout: 10000, // 10 seconds timeout for initial fix
@@ -158,8 +163,15 @@ async function startRide() {
         });
 
         // Add device motion listener
-        window.addEventListener('devicemotion', handleMotion);
-        motionListenerActive = true;
+        if ('DeviceMotionEvent' in window) { // Check if DeviceMotionEvent is supported
+            window.addEventListener('devicemotion', handleMotion);
+            motionListenerActive = true;
+            console.log('DeviceMotion listener attached.');
+        } else {
+            console.warn('DeviceMotionEvent not supported on this device/browser.');
+            statusDiv.textContent = 'Device motion not supported. Roughness data may not be recorded.';
+        }
+
 
         // Save initial ride entry to IndexedDB
         const transaction = db.transaction(['rides'], 'readwrite');
@@ -185,6 +197,15 @@ async function startRide() {
         // Ensure buttons are reset if start fails
         startButton.disabled = false;
         stopButton.disabled = true;
+        // Attempt to clean up any started listeners if an error occurred during setup
+        if (watchId !== null) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+        }
+        if (motionListenerActive) {
+            window.removeEventListener('devicemotion', handleMotion);
+            motionListenerActive = false;
+        }
     }
 }
 
@@ -195,10 +216,12 @@ async function stopRide() {
     if (watchId !== null) {
         navigator.geolocation.clearWatch(watchId);
         watchId = null;
+        console.log('GPS watch cleared.');
     }
     if (motionListenerActive) {
         window.removeEventListener('devicemotion', handleMotion);
         motionListenerActive = false;
+        console.log('DeviceMotion listener removed.');
     }
 
     statusDiv.textContent = 'Saving ride data...';
@@ -214,18 +237,28 @@ async function stopRide() {
         }
 
         // Update the ride summary
-        const existingRide = await ridesStore.get(currentRideId);
-        if (existingRide) {
-            // Create a new, plain object from the existing one using spread syntax
-            // This is crucial to avoid DataCloneError if the object from IndexedDB
-            // holds internal references that prevent direct cloning.
-            const rideToUpdate = { ...existingRide };
+        const existingRideRequest = ridesStore.get(currentRideId);
+        const existingRide = await new Promise((resolve, reject) => {
+            existingRideRequest.onsuccess = (event) => resolve(event.target.result);
+            existingRideRequest.onerror = (event) => reject(event.target.error);
+        });
 
-            rideToUpdate.endTime = Date.now();
-            rideToUpdate.duration = Math.floor((rideToUpdate.endTime - rideToUpdate.startTime) / 1000); // in seconds
-            rideToUpdate.totalDataPoints = currentRideDataPoints.length;
-            rideToUpdate.status = 'completed';
-            await ridesStore.put(rideToUpdate); // Use the new plain object for 'put'
+        if (existingRide) {
+            // Explicitly create a new plain object to avoid DataCloneError
+            const rideToUpdate = {
+                rideId: existingRide.rideId,
+                startTime: existingRide.startTime,
+                endTime: Date.now(),
+                duration: Math.floor((Date.now() - existingRide.startTime) / 1000), // in seconds
+                totalDataPoints: currentRideDataPoints.length,
+                status: 'completed'
+            };
+
+            const putRequest = ridesStore.put(rideToUpdate);
+            await new Promise((resolve, reject) => {
+                putRequest.onsuccess = () => resolve();
+                putRequest.onerror = (event) => reject(event.target.error);
+            });
         }
         await transaction.complete; // Wait for transaction to complete
 
@@ -258,14 +291,19 @@ async function loadPastRides() {
     try {
         const transaction = db.transaction(['rides'], 'readonly');
         const store = transaction.objectStore('rides');
-        const rawRides = await store.getAll(); // Get the raw result
-        await transaction.complete;
+        
+        // Use explicit request.onsuccess to get the result as an Array
+        const request = store.getAll();
+        const allRides = await new Promise((resolve, reject) => {
+            request.onsuccess = (event) => resolve(event.target.result);
+            request.onerror = (event) => reject(event.target.error);
+        });
+        
+        await transaction.complete; // Ensure transaction completes
 
-        // Explicitly convert to an Array using Array.from() to ensure .sort() method exists.
-        const allRides = Array.from(rawRides);
-
-        if (allRides.length === 0) {
+        if (!Array.isArray(allRides) || allRides.length === 0) {
             pastRidesList.innerHTML = '<li class="text-center text-gray-500">No past rides recorded.</li>';
+            console.log('No past rides found or allRides is not an array:', allRides);
             return;
         }
 
@@ -287,6 +325,7 @@ async function loadPastRides() {
             listItem.addEventListener('click', () => showRideDetails(ride.rideId));
             pastRidesList.appendChild(listItem);
         });
+        console.log('Past rides loaded successfully.');
     } catch (error) {
         console.error('Error loading past rides:', error);
         statusDiv.textContent = 'Error loading past rides.';
@@ -303,12 +342,23 @@ async function showRideDetails(rideId) {
         const dataPointsStore = transaction.objectStore('rideDataPoints');
         const rideIndex = dataPointsStore.index('by_rideId');
 
-        const ride = await ridesStore.get(rideId);
-        const dataPoints = await rideIndex.getAll(rideId);
+        const rideRequest = ridesStore.get(rideId);
+        const dataPointsRequest = rideIndex.getAll(rideId);
+
+        const ride = await new Promise((resolve, reject) => {
+            rideRequest.onsuccess = (event) => resolve(event.target.result);
+            rideRequest.onerror = (event) => reject(event.target.error);
+        });
+        const dataPoints = await new Promise((resolve, reject) => {
+            dataPointsRequest.onsuccess = (event) => resolve(event.target.result);
+            dataPointsRequest.onerror = (event) => reject(event.target.error);
+        });
+
         await transaction.complete;
 
-        if (!ride || dataPoints.length === 0) {
+        if (!ride || !Array.isArray(dataPoints) || dataPoints.length === 0) {
             detailContent.textContent = 'No details found for this ride.';
+            console.warn(`No ride data found for ID: ${rideId}. Ride:`, ride, 'Data points:', dataPoints);
             return;
         }
 
@@ -321,9 +371,9 @@ async function showRideDetails(rideId) {
 
         dataPoints.forEach(dp => {
             detailsText += `Timestamp: ${new Date(dp.timestamp).toLocaleTimeString()} | ` +
-                           `Lat: ${dp.latitude.toFixed(5)} | ` +
-                           `Lon: ${dp.longitude.toFixed(5)} | ` +
-                           `Roughness: ${dp.roughnessValue.toFixed(3)}\n`;
+                           `Lat: ${dp.latitude?.toFixed(5) ?? 'N/A'} | ` + // Added nullish coalescing for safety
+                           `Lon: ${dp.longitude?.toFixed(5) ?? 'N/A'} | ` +
+                           `Roughness: ${dp.roughnessValue?.toFixed(3) ?? 'N/A'}\n`; // Added nullish coalescing for safety
         });
 
         detailContent.textContent = detailsText;
@@ -372,6 +422,12 @@ document.addEventListener('DOMContentLoaded', () => {
     startButton.addEventListener('click', startRide);
     stopButton.addEventListener('click', stopRide);
     closeDetailButton.addEventListener('click', hideRideDetails);
+
+    // Initial check for DeviceMotionEvent support when the app loads
+    if (!('DeviceMotionEvent' in window)) {
+        console.warn('DeviceMotionEvent is not supported in this browser/device.');
+        statusDiv.textContent = 'Device motion (accelerometer) not supported. Roughness data will not be available.';
+    }
 
     openDb(); // Open IndexedDB and then load past rides
 });
