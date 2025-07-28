@@ -474,14 +474,23 @@ async function showRideDetails(rideId) {
   }
 
   // **Sort chronologically by timestamp** before charting
-  dps.sort((a, b) => a.timestamp - b.timestamp);
-
-  // Populate recap chart
-  const data = dps.map(dp => ({ x: new Date(dp.timestamp), y: dp.roughnessValue, meta: dp }));
+  // ensure chronological order by timestamp
+  // 1) Sort chronologically
+  dps.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  
+  // 2) Build chart points
+  const chartData = dps.map(dp => ({
+    x: new Date(dp.timestamp),
+    y: dp.roughnessValue,
+    meta: dp
+  }));
+  
+  // 3) Update recap chart
   if (recapChart) {
-    recapChart.data.datasets[0].data = data;
+    recapChart.data.datasets[0].data = chartData;
     recapChart.update();
   }
+
 
   // Populate recap map
   recapRidePath.setLatLngs([]);
