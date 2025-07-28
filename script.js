@@ -9,15 +9,15 @@ let watchId = null; // To store the ID returned by watchPosition
 let motionListenerActive = false;
 let accelerometerInterval = null; // To store the interval for accelerometer processing
 
-// DOM Elements
-const statusDiv = document.getElementById('status');
-const startButton = document.getElementById('startButton');
-const stopButton = document.getElementById('stopButton');
-const dataPointsCounter = document.getElementById('dataPointsCounter');
-const pastRidesList = document.getElementById('pastRidesList');
-const rideDetailView = document.getElementById('rideDetailView');
-const detailContent = document.getElementById('detailContent');
-const closeDetailButton = document.getElementById('closeDetailButton');
+// DOM Elements - Declare them here, but assign them inside DOMContentLoaded
+let statusDiv;
+let startButton;
+let stopButton;
+let dataPointsCounter;
+let pastRidesList;
+let rideDetailView;
+let detailContent;
+let closeDetailButton;
 
 const DB_NAME = 'BikeRoughnessDB';
 const DB_VERSION = 1;
@@ -343,12 +343,22 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
     return d;
 }
 
-// --- Event Listeners ---
-startButton.addEventListener('click', startRide);
-stopButton.addEventListener('click', stopRide);
-closeDetailButton.addEventListener('click', hideRideDetails);
-
 // --- Initialize on DOMContentLoaded ---
 document.addEventListener('DOMContentLoaded', () => {
+    // Assign DOM elements AFTER the DOM is fully loaded
+    statusDiv = document.getElementById('status');
+    startButton = document.getElementById('startButton');
+    stopButton = document.getElementById('stopButton');
+    dataPointsCounter = document.getElementById('dataPointsCounter');
+    pastRidesList = document.getElementById('pastRidesList');
+    rideDetailView = document.getElementById('rideDetailView');
+    detailContent = document.getElementById('detailContent');
+    closeDetailButton = document.getElementById('closeDetailButton');
+
+    // Attach event listeners AFTER elements are assigned
+    startButton.addEventListener('click', startRide);
+    stopButton.addEventListener('click', stopRide);
+    closeDetailButton.addEventListener('click', hideRideDetails);
+
     openDb(); // Open IndexedDB and then load past rides
 });
