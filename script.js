@@ -1,12 +1,19 @@
 // Global variables for IndexedDB and ride state
 let db;
 let currentRideId = null;
-let currentRideDataPoints = [];
-let accelerometerBuffer = [];
-let lastGpsTimestamp = 0;
-let lastGpsCoords = { latitude: 0, longitude: 0 };
+let currentRideDataPoints = []; // Stores data points for the *current* ride
+let accelerometerBuffer = []; // Buffer for raw accelerometer Z-axis values
+let latestGpsPosition = null; // Stores the most recent raw GPS position
 let watchId = null; // To store the ID returned by watchPosition
 let motionListenerActive = false;
+let dataCollectionInterval = null; // To store the interval for combined data processing
+
+// Map variables
+let map = null;
+let currentLocationMarker = null;
+let currentRidePath = null; // Leaflet polyline for the current ride's path
+let historicalRoughnessLayer = null; // Leaflet layer group for historical data markers
+let mapInitialized = false; // Flag to ensure map is only initialized once
 
 // DOM Elements - Declare them here, but assign them inside DOMContentLoaded
 let statusDiv;
@@ -19,7 +26,9 @@ let detailContent;
 let closeDetailButton;
 
 const DB_NAME = 'BikeRoughnessDB';
-const DB_VERSION = 1;
+const DB_VERSION = 2; // *** IMPORTANT: Increment DB version for schema changes ***
+const DATA_COLLECTION_INTERVAL_MS = 3000; // 3 seconds
+const HISTORICAL_DATA_RADIUS_M = 150; // Radius for displaying previous roughness data
 
 // --- IndexedDB Helper Function ---
 // This function wraps an IDBRequest into a Promise,
@@ -49,10 +58,17 @@ function openDb() {
                 console.log('Object store "rides" created.');
             }
             if (!db.objectStoreNames.contains('rideDataPoints')) {
-                const dataPointsStore = db.createObjectStore('rideDataPoints', { keyPath: 'id' });
-                // Create an index on rideId for efficient querying
+                db.createObjectStore('rideDataPoints', { keyPath: 'id' });
+                const dataPointsStore = db.transaction.objectStore('rideDataPoints'); // Get reference for index creation
                 dataPointsStore.createIndex('by_rideId', 'rideId', { unique: false });
                 console.log('Object store "rideDataPoints" created.');
+            }
+            // *** NEW: RoughnessMap object store for global unique locations ***
+            if (!db.objectStoreNames.contains('RoughnessMap')) {
+                db.createObjectStore('RoughnessMap', { keyPath: 'geoId' });
+                // We might add indexes for lat/lon if we want to do more complex spatial queries later,
+                // but for 150m, getting all and filtering client-side is often simpler for MVP.
+                console.log('Object store "RoughnessMap" created.');
             }
             console.log('IndexedDB upgrade complete.');
         };
@@ -72,9 +88,26 @@ function openDb() {
     });
 }
 
-// --- Geolocation and DeviceMotion Handlers ---
+// --- Map Initialization ---
+function initializeMap() {
+    if (mapInitialized) return;
 
-// Calculate variance for roughness
+    // Default view for Calgary
+    map = L.map('map').setView([51.0447, -114.0719], 13);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    // Initialize layers
+    historicalRoughnessLayer = L.layerGroup().addTo(map);
+    currentRidePath = L.polyline([], { color: '#808080', weight: 4 }).addTo(map); // Default color for current path
+
+    mapInitialized = true;
+    console.log('Leaflet map initialized.');
+}
+
+// --- Utility Functions ---
 function calculateVariance(data) {
     if (data.length === 0) return 0;
     const mean = data.reduce((sum, val) => sum + val, 0) / data.length;
@@ -82,44 +115,44 @@ function calculateVariance(data) {
     return variance;
 }
 
-// GPS success callback
+// Grayscale color based on roughness (0=smooth, higher=rougher)
+// Returns hex color string, e.g., #FFFFFF for 0, #000000 for max_roughness
+function roughnessToGrayscale(roughness, maxRoughness = 100) { // Adjust maxRoughness based on observed data
+    const normalized = Math.min(1, roughness / maxRoughness);
+    const grayValue = Math.floor(255 * (1 - normalized)); // Invert: 255 for smooth, 0 for rough
+    const hex = grayValue.toString(16).padStart(2, '0');
+    return `#${hex}${hex}${hex}`;
+}
+
+// Generates a geographic ID for proximity-based updates (e.g., "45.1234_114.5678")
+// Adjust precision for desired proximity: 4 decimal places is ~11 meters at equator
+function getGeoId(latitude, longitude, precision = 4) {
+    return `${latitude.toFixed(precision)}_${longitude.toFixed(precision)}`;
+}
+
+// Haversine formula for distance calculation between two lat/lon points in meters
+function calculateDistance(lat1, lon1, lat2, lon2) {
+    const R = 6371e3; // metres
+    const φ1 = lat1 * Math.PI / 180; // φ, λ in radians
+    const φ2 = lat2 * Math.PI / 180;
+    const Δφ = (lat2 - lat1) * Math.PI / 180;
+    const Δλ = (lon2 - lon1) * Math.PI / 180;
+
+    const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+              Math.cos(φ1) * Math.cos(φ2) *
+              Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+    const d = R * c; // in metres
+    return d;
+}
+
+// --- Sensor Data Collection & Processing ---
+
+// GPS success callback - just updates latestGpsPosition
 function gpsSuccess(position) {
-    const { latitude, longitude, altitude, accuracy } = position.coords;
-    const timestamp = position.timestamp;
-
-    // Throttle GPS updates: only record if moved significantly or enough time passed
-    const distanceMoved = calculateDistance(
-        lastGpsCoords.latitude, lastGpsCoords.longitude,
-        latitude, longitude
-    ); // Haversine formula for distance
-    const timeElapsed = timestamp - lastGpsTimestamp;
-
-    if (timeElapsed >= 2000 || distanceMoved >= 5) { // 2 seconds or 5 meters
-        let roughnessValue = 0;
-        if (accelerometerBuffer.length > 0) {
-            roughnessValue = calculateVariance(accelerometerBuffer);
-            // console.log(`Processed ${accelerometerBuffer.length} accel points. Roughness: ${roughnessValue.toFixed(3)}`); // Debugging line
-            accelerometerBuffer = []; // Clear buffer after processing
-        } else {
-            // console.log("Accelerometer buffer was empty when GPS point arrived."); // Debugging line
-        }
-
-        const dataPoint = {
-            id: crypto.randomUUID(), // Generate a unique ID for each data point
-            rideId: currentRideId,
-            timestamp: timestamp,
-            latitude: latitude,
-            longitude: longitude,
-            altitude: altitude,
-            accuracy: accuracy,
-            roughnessValue: roughnessValue
-        };
-        currentRideDataPoints.push(dataPoint);
-        dataPointsCounter.textContent = `Data Points: ${currentRideDataPoints.length}`;
-        lastGpsTimestamp = timestamp;
-        lastGpsCoords = { latitude, longitude };
-        statusDiv.textContent = `Recording... Lat: ${latitude.toFixed(4)}, Lon: ${longitude.toFixed(4)}, Roughness: ${roughnessValue.toFixed(2)}`;
-    }
+    latestGpsPosition = position;
+    // console.log(`Raw GPS: ${position.coords.latitude.toFixed(4)}, ${position.coords.longitude.toFixed(4)}`);
 }
 
 // GPS error callback
@@ -138,22 +171,168 @@ function gpsError(error) {
     }
     statusDiv.textContent = errorMessage;
     console.error('GPS Error:', error);
-    // Automatically stop ride on critical errors like permission denied
     if (error.code === error.PERMISSION_DENIED) {
         stopRide();
     }
 }
 
-// DeviceMotion handler
+// DeviceMotion handler - just buffers accelerometer data
 function handleMotion(event) {
-    if (currentRideId && event.accelerationIncludingGravity) {
+    if (event.accelerationIncludingGravity) {
         const z = event.accelerationIncludingGravity.z;
-        if (typeof z === 'number' && !isNaN(z)) { // Ensure it's a valid number
+        if (typeof z === 'number' && !isNaN(z)) {
              accelerometerBuffer.push(z);
-            //  console.log(`Accel Z: ${z.toFixed(2)} (Buffer size: ${accelerometerBuffer.length})`); // Debugging line
         }
     }
 }
+
+// Main function to process combined sensor data every X seconds
+async function processCombinedDataPoint() {
+    if (!currentRideId || !latestGpsPosition) {
+        statusDiv.textContent = 'Recording... Waiting for GPS fix.';
+        return; // Wait for first GPS fix
+    }
+
+    const { latitude, longitude, altitude, accuracy } = latestGpsPosition.coords;
+    const timestamp = latestGpsPosition.timestamp;
+
+    let roughnessValue = 0;
+    if (accelerometerBuffer.length > 0) {
+        roughnessValue = calculateVariance(accelerometerBuffer);
+        accelerometerBuffer = []; // Clear buffer after processing
+    }
+
+    const dataPoint = {
+        id: crypto.randomUUID(),
+        rideId: currentRideId, // Link to current ride history
+        timestamp: timestamp,
+        latitude: latitude,
+        longitude: longitude,
+        altitude: altitude,
+        accuracy: accuracy,
+        roughnessValue: roughnessValue
+    };
+
+    // 1. Add to current ride's history data
+    currentRideDataPoints.push(dataPoint);
+    dataPointsCounter.textContent = `Data Points: ${currentRideDataPoints.length}`;
+
+    // 2. Update RoughnessMap (global map data)
+    await updateRoughnessMap(dataPoint);
+
+    // 3. Update Map UI
+    updateMapDisplay(dataPoint);
+
+    statusDiv.textContent = `Recording... Lat: ${latitude.toFixed(4)}, Lon: ${longitude.toFixed(4)}, Roughness: ${roughnessValue.toFixed(2)}`;
+}
+
+// --- RoughnessMap (Global Data) Management ---
+async function updateRoughnessMap(newDataPoint) {
+    const geoId = getGeoId(newDataPoint.latitude, newDataPoint.longitude);
+    const roughnessMapTx = db.transaction(['RoughnessMap'], 'readwrite');
+    const roughnessMapStore = roughnessMapTx.objectStore('RoughnessMap');
+
+    try {
+        const existingEntry = await promisifiedDbRequest(roughnessMapStore.get(geoId));
+
+        let entryToSave;
+        if (existingEntry) {
+            // Overwrite existing data at the same geoId
+            entryToSave = {
+                ...existingEntry, // Keep existing properties
+                latitude: newDataPoint.latitude, // Update with more precise current location
+                longitude: newDataPoint.longitude,
+                roughnessValue: newDataPoint.roughnessValue, // Overwrite roughness
+                lastUpdated: newDataPoint.timestamp // Update timestamp
+            };
+            console.log(`Updated RoughnessMap for ${geoId} with new roughness: ${newDataPoint.roughnessValue.toFixed(2)}`);
+        } else {
+            // Add new entry
+            entryToSave = {
+                geoId: geoId,
+                latitude: newDataPoint.latitude,
+                longitude: newDataPoint.longitude,
+                roughnessValue: newDataPoint.roughnessValue,
+                lastUpdated: newDataPoint.timestamp
+            };
+            console.log(`Added new RoughnessMap entry for ${geoId} with roughness: ${newDataPoint.roughnessValue.toFixed(2)}`);
+        }
+        await promisifiedDbRequest(roughnessMapStore.put(entryToSave));
+        await roughnessMapTx.complete;
+    } catch (error) {
+        console.error('Error updating RoughnessMap:', error);
+    }
+}
+
+// --- Map Display Functions ---
+function updateMapDisplay(dataPoint) {
+    const latlng = [dataPoint.latitude, dataPoint.longitude];
+
+    // Update current location marker
+    if (!currentLocationMarker) {
+        currentLocationMarker = L.marker(latlng).addTo(map);
+    } else {
+        currentLocationMarker.setLatLng(latlng);
+    }
+
+    // Update map view to follow rider
+    map.setView(latlng, map.getZoom() > 15 ? map.getZoom() : 15); // Zoom in if not already very close
+
+    // Update current ride path
+    const currentPathLatLngs = currentRidePath.getLatLngs();
+    if (currentPathLatLngs.length > 0) {
+        // Create a new polyline segment for just the last part to color it
+        const prevLatLng = currentPathLatLngs[currentPathLatLngs.length - 1];
+        L.polyline([prevLatLng, latlng], {
+            color: roughnessToGrayscale(dataPoint.roughnessValue),
+            weight: 5
+        }).addTo(map);
+    } else {
+        // For the very first point, add it and it will be part of the first segment
+        L.polyline([latlng, latlng], { // A tiny segment to show the start point's color
+            color: roughnessToGrayscale(dataPoint.roughnessValue),
+            weight: 5
+        }).addTo(map);
+    }
+    // Add the new point to the currentRidePath's internal list for future segments
+    currentRidePath.addLatLng(latlng);
+
+
+    // Update historical roughness data on map
+    updateHistoricalRoughnessDisplay(dataPoint.latitude, dataPoint.longitude);
+}
+
+async function updateHistoricalRoughnessDisplay(currentLat, currentLon) {
+    historicalRoughnessLayer.clearLayers(); // Clear previous historical markers
+
+    const roughnessMapTx = db.transaction(['RoughnessMap'], 'readonly');
+    const roughnessMapStore = roughnessMapTx.objectStore('RoughnessMap');
+
+    try {
+        const allRoughnessPoints = await promisifiedDbRequest(roughnessMapStore.getAll());
+        await roughnessMapTx.complete;
+
+        allRoughnessPoints.forEach(point => {
+            const distance = calculateDistance(currentLat, currentLon, point.latitude, point.longitude);
+            if (distance <= HISTORICAL_DATA_RADIUS_M) {
+                // Add a circle marker for historical points within radius
+                L.circleMarker([point.latitude, point.longitude], {
+                    radius: 4,
+                    fillColor: roughnessToGrayscale(point.roughnessValue),
+                    color: '#000',
+                    weight: 1,
+                    opacity: 0.7,
+                    fillOpacity: 0.7
+                })
+                .bindPopup(`Roughness: ${point.roughnessValue.toFixed(2)}<br>Updated: ${new Date(point.lastUpdated).toLocaleDateString()}`)
+                .addTo(historicalRoughnessLayer);
+            }
+        });
+    } catch (error) {
+        console.error('Error loading historical roughness data:', error);
+    }
+}
+
 
 // --- Ride Control Functions ---
 
@@ -164,21 +343,33 @@ async function startRide() {
     currentRideId = Date.now(); // Use timestamp as unique ride ID
     currentRideDataPoints = [];
     accelerometerBuffer = [];
-    lastGpsTimestamp = 0;
-    lastGpsCoords = { latitude: 0, longitude: 0 };
+    latestGpsPosition = null; // Clear latest GPS for new ride
     dataPointsCounter.textContent = 'Data Points: 0';
     statusDiv.textContent = 'Requesting GPS and motion permissions...';
 
+    // Clear previous map path and markers for new ride
+    if (currentRidePath) {
+        currentRidePath.setLatLngs([]); // Reset polyline
+        map.removeLayer(currentRidePath); // Remove old polyline
+    }
+    currentRidePath = L.polyline([], { color: '#808080', weight: 5 }).addTo(map); // Add new polyline
+    
+    if (currentLocationMarker) {
+        map.removeLayer(currentLocationMarker);
+        currentLocationMarker = null; // Remove old marker
+    }
+    historicalRoughnessLayer.clearLayers(); // Clear historical layer too
+
     try {
-        // Request geolocation permission (watchPosition implicitly requests)
+        // Start watching raw GPS position
         watchId = navigator.geolocation.watchPosition(gpsSuccess, gpsError, {
             enableHighAccuracy: true,
-            timeout: 10000, // 10 seconds timeout for initial fix
-            maximumAge: 0 // No cached position
+            timeout: 10000,
+            maximumAge: 0
         });
 
         // Add device motion listener
-        if ('DeviceMotionEvent' in window) { // Check if DeviceMotionEvent is supported
+        if ('DeviceMotionEvent' in window) {
             window.addEventListener('devicemotion', handleMotion);
             motionListenerActive = true;
             console.log('DeviceMotion listener attached.');
@@ -187,11 +378,14 @@ async function startRide() {
             statusDiv.textContent = 'Device motion not supported. Roughness data may not be recorded.';
         }
 
+        // Start interval for processing combined data every 3 seconds
+        dataCollectionInterval = setInterval(processCombinedDataPoint, DATA_COLLECTION_INTERVAL_MS);
+        console.log(`Data collection interval started (every ${DATA_COLLECTION_INTERVAL_MS / 1000}s).`);
 
         // Save initial ride entry to IndexedDB
         const transaction = db.transaction(['rides'], 'readwrite');
         const store = transaction.objectStore('rides');
-        await promisifiedDbRequest(store.add({ // Use the helper
+        await promisifiedDbRequest(store.add({
             rideId: currentRideId,
             startTime: currentRideId,
             endTime: null,
@@ -199,7 +393,7 @@ async function startRide() {
             totalDataPoints: 0,
             status: 'active'
         }));
-        await transaction.complete; // Wait for transaction to complete
+        await transaction.complete;
 
         startButton.disabled = true;
         stopButton.disabled = false;
@@ -209,10 +403,9 @@ async function startRide() {
     } catch (error) {
         console.error('Error starting ride:', error);
         statusDiv.textContent = 'Failed to start ride. Check permissions and device support.';
-        // Ensure buttons are reset if start fails
         startButton.disabled = false;
         stopButton.disabled = true;
-        // Attempt to clean up any started listeners if an error occurred during setup
+        // Clean up any started listeners if an error occurred during setup
         if (watchId !== null) {
             navigator.geolocation.clearWatch(watchId);
             watchId = null;
@@ -220,6 +413,10 @@ async function startRide() {
         if (motionListenerActive) {
             window.removeEventListener('devicemotion', handleMotion);
             motionListenerActive = false;
+        }
+        if (dataCollectionInterval !== null) {
+            clearInterval(dataCollectionInterval);
+            dataCollectionInterval = null;
         }
     }
 }
@@ -238,6 +435,11 @@ async function stopRide() {
         motionListenerActive = false;
         console.log('DeviceMotion listener removed.');
     }
+    if (dataCollectionInterval !== null) {
+        clearInterval(dataCollectionInterval);
+        dataCollectionInterval = null;
+        console.log('Data collection interval cleared.');
+    }
 
     statusDiv.textContent = 'Saving ride data...';
 
@@ -246,19 +448,17 @@ async function stopRide() {
         const ridesStore = transaction.objectStore('rides');
         const dataPointsStore = transaction.objectStore('rideDataPoints');
 
-        // Add all collected data points to IndexedDB
+        // Add all collected data points for the current ride to IndexedDB
         for (const dp of currentRideDataPoints) {
-            await promisifiedDbRequest(dataPointsStore.put(dp)); // Use the helper
+            await promisifiedDbRequest(dataPointsStore.put(dp));
         }
 
         // Update the ride summary
         const existingRide = await promisifiedDbRequest(ridesStore.get(currentRideId));
        
         if (existingRide) {
-            // *** CRITICAL FIX FOR DATACLONEERROR & DataError ***
-            // Explicitly create a new object and assign properties, ensuring 'rideId' is there.
             const rideToUpdate = {
-                rideId: existingRide.rideId, // Ensure rideId is copied from the fetched object
+                rideId: existingRide.rideId,
                 startTime: existingRide.startTime,
                 endTime: Date.now(),
                 duration: Math.floor((Date.now() - existingRide.startTime) / 1000), // in seconds
@@ -266,16 +466,14 @@ async function stopRide() {
                 status: 'completed'
             };
 
-            // Verify rideId exists on the object to be stored,
-            // this handles the "key path did not yield a value" DataError.
             if (typeof rideToUpdate.rideId === 'undefined' || rideToUpdate.rideId === null) {
                 console.error("Error: rideId is missing or null for object to be stored.", rideToUpdate);
                 throw new Error("Cannot save ride: rideId is missing.");
             }
 
-            await promisifiedDbRequest(ridesStore.put(rideToUpdate)); // Use the helper
+            await promisifiedDbRequest(ridesStore.put(rideToUpdate));
         }
-        await transaction.complete; // Wait for transaction to complete
+        await transaction.complete;
 
         statusDiv.textContent = `Ride ${currentRideId} saved successfully!`;
         console.log(`Ride ${currentRideId} stopped and saved.`);
@@ -288,9 +486,19 @@ async function stopRide() {
         currentRideId = null;
         currentRideDataPoints = [];
         accelerometerBuffer = [];
+        latestGpsPosition = null; // Clear latest GPS position
         startButton.disabled = false;
         stopButton.disabled = true;
         dataPointsCounter.textContent = 'Data Points: 0';
+        
+        // Clear current ride path from map
+        if (currentRidePath) {
+            currentRidePath.setLatLngs([]);
+            if(currentLocationMarker) map.removeLayer(currentLocationMarker); // Remove location marker
+            currentLocationMarker = null;
+        }
+        historicalRoughnessLayer.clearLayers(); // Clear historical layer after ride ends
+
         loadPastRides(); // Refresh the list of past rides
     }
 }
@@ -307,17 +515,14 @@ async function loadPastRides() {
         const transaction = db.transaction(['rides'], 'readonly');
         const store = transaction.objectStore('rides');
         
-        // *** CRITICAL FIX FOR .sort IS NOT A FUNCTION ***
-        // Use the promisified helper to ensure we get the actual result array.
         const allRides = await promisifiedDbRequest(store.getAll()); 
         
-        await transaction.complete; // Ensure transaction completes after getting data
+        await transaction.complete;
 
-        // Explicitly check if it's an array for maximum robustness
         if (!Array.isArray(allRides)) {
             console.error('store.getAll() did not return an array despite promisified request:', allRides);
             statusDiv.textContent = 'Error: Unexpected data type for past rides.';
-            return; // Exit if not an array
+            return;
         }
 
         if (allRides.length === 0) {
@@ -326,7 +531,6 @@ async function loadPastRides() {
             return;
         }
 
-        // Sort by start time, newest first
         allRides.sort((a, b) => b.startTime - a.startTime);
 
         allRides.forEach(ride => {
@@ -381,9 +585,9 @@ async function showRideDetails(rideId) {
 
         dataPoints.forEach(dp => {
             detailsText += `Timestamp: ${new Date(dp.timestamp).toLocaleTimeString()} | ` +
-                           `Lat: ${dp.latitude?.toFixed(5) ?? 'N/A'} | ` + // Added nullish coalescing for safety
+                           `Lat: ${dp.latitude?.toFixed(5) ?? 'N/A'} | ` +
                            `Lon: ${dp.longitude?.toFixed(5) ?? 'N/A'} | ` +
-                           `Roughness: ${dp.roughnessValue?.toFixed(3) ?? 'N/A'}\n`; // Added nullish coalescing for safety
+                           `Roughness: ${dp.roughnessValue?.toFixed(3) ?? 'N/A'}\n`;
         });
 
         detailContent.textContent = detailsText;
@@ -397,23 +601,6 @@ async function showRideDetails(rideId) {
 function hideRideDetails() {
     rideDetailView.classList.add('hidden');
     detailContent.textContent = '';
-}
-
-// --- Utility Function (Haversine for distance calculation) ---
-function calculateDistance(lat1, lon1, lat2, lon2) {
-    const R = 6371e3; // metres
-    const φ1 = lat1 * Math.PI / 180; // φ, λ in radians
-    const φ2 = lat2 * Math.PI / 180;
-    const Δφ = (lat2 - lat1) * Math.PI / 180;
-    const Δλ = (lon2 - lon1) * Math.PI / 180;
-
-    const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
-              Math.cos(φ1) * Math.cos(φ2) *
-              Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-    const d = R * c; // in metres
-    return d;
 }
 
 // --- Initialize on DOMContentLoaded ---
@@ -439,5 +626,6 @@ document.addEventListener('DOMContentLoaded', () => {
         statusDiv.textContent = 'Device motion (accelerometer) not supported. Roughness data will not be available.';
     }
 
+    initializeMap(); // Initialize the map here
     openDb(); // Open IndexedDB and then load past rides
 });
