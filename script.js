@@ -7,7 +7,6 @@ let lastGpsTimestamp = 0;
 let lastGpsCoords = { latitude: 0, longitude: 0 };
 let watchId = null; // To store the ID returned by watchPosition
 let motionListenerActive = false;
-let accelerometerInterval = null; // To store the interval for accelerometer processing
 
 // DOM Elements - Declare them here, but assign them inside DOMContentLoaded
 let statusDiv;
@@ -120,7 +119,11 @@ function gpsError(error) {
     }
     statusDiv.textContent = errorMessage;
     console.error('GPS Error:', error);
-    stopRide(); // Stop ride on critical GPS error
+    // Do not automatically stop ride on all errors to allow recovery,
+    // but on PERMISSION_DENIED or if watchId is invalid, it should stop.
+    // For MVP, we'll keep the stopRide() call for now, but in a real app,
+    // you might want more nuanced error handling.
+    stopRide();
 }
 
 // DeviceMotion handler
@@ -179,7 +182,9 @@ async function startRide() {
     } catch (error) {
         console.error('Error starting ride:', error);
         statusDiv.textContent = 'Failed to start ride. Check permissions and device support.';
-        stopRide(); // Clean up if start fails
+        // Ensure buttons are reset if start fails
+        startButton.disabled = false;
+        stopButton.disabled = true;
     }
 }
 
@@ -209,13 +214,18 @@ async function stopRide() {
         }
 
         // Update the ride summary
-        const ride = await ridesStore.get(currentRideId);
-        if (ride) {
-            ride.endTime = Date.now();
-            ride.duration = Math.floor((ride.endTime - ride.startTime) / 1000); // in seconds
-            ride.totalDataPoints = currentRideDataPoints.length;
-            ride.status = 'completed';
-            await ridesStore.put(ride); // Update the existing ride entry
+        const existingRide = await ridesStore.get(currentRideId);
+        if (existingRide) {
+            // Create a new, plain object from the existing one using spread syntax
+            // This is crucial to avoid DataCloneError if the object from IndexedDB
+            // holds internal references that prevent direct cloning.
+            const rideToUpdate = { ...existingRide };
+
+            rideToUpdate.endTime = Date.now();
+            rideToUpdate.duration = Math.floor((rideToUpdate.endTime - rideToUpdate.startTime) / 1000); // in seconds
+            rideToUpdate.totalDataPoints = currentRideDataPoints.length;
+            rideToUpdate.status = 'completed';
+            await ridesStore.put(rideToUpdate); // Use the new plain object for 'put'
         }
         await transaction.complete; // Wait for transaction to complete
 
@@ -248,8 +258,11 @@ async function loadPastRides() {
     try {
         const transaction = db.transaction(['rides'], 'readonly');
         const store = transaction.objectStore('rides');
-        const allRides = await store.getAll();
+        const rawRides = await store.getAll(); // Get the raw result
         await transaction.complete;
+
+        // Explicitly convert to an Array using Array.from() to ensure .sort() method exists.
+        const allRides = Array.from(rawRides);
 
         if (allRides.length === 0) {
             pastRidesList.innerHTML = '<li class="text-center text-gray-500">No past rides recorded.</li>';
